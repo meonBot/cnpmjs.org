@@ -8,6 +8,7 @@ var thunkify = require('thunkify-wrap');
 var EventEmitter = require('events').EventEmitter;
 var util = require('util');
 var fs = require('fs');
+var mzFs = require('mz/fs');
 var path = require('path');
 var crypto = require('crypto');
 var sleep = require('co-sleep');
@@ -48,10 +49,13 @@ function SyncModuleWorker(options) {
   this.names = options.name;
   this.startName = this.names[0];
 
+  this.syncPrivatePackage = options.syncPrivatePackage;
+
   this.username = options.username;
   this.concurrency = options.concurrency || 1;
   this._publish = options.publish === true; // _publish_on_cnpm
   this.syncUpstreamFirst = options.syncUpstreamFirst;
+  this.syncFromBackupFile = options.syncFromBackupFile;
 
   this.syncingNames = {};
   this.nameMap = {};
@@ -164,6 +168,7 @@ SyncModuleWorker.prototype.start = function () {
     }
     yield arr;
     that._saveLog();
+    yield that._saveBackupFiles();
   }).catch(function (err) {
     logger.error(err);
     that._saveLog();
@@ -215,18 +220,24 @@ SyncModuleWorker.prototype._doneOne = function* (concurrencyId, name, success) {
 };
 
 SyncModuleWorker.prototype.syncUpstream = function* (name) {
-  if (config.sourceNpmRegistry.indexOf('registry.npmjs.org') >= 0 ||
-      config.sourceNpmRegistry.indexOf('registry.npmjs.com') >= 0 ||
-      config.sourceNpmRegistry.indexOf('replicate.npmjs.com') >= 0) {
+  var sourceNpmRegistry = config.sourceNpmRegistry;
+  if (config.enableWebDataRemoteRegistry) {
+    sourceNpmRegistry = config.webDataRemoteRegistry;
+  }
+
+  if (sourceNpmRegistry.indexOf('registry.npmjs.org') >= 0 ||
+      sourceNpmRegistry.indexOf('registry.npmjs.com') >= 0 ||
+      sourceNpmRegistry.indexOf('replicate.npmjs.com') >= 0) {
     this.log('----------------- upstream is npm registry: %s, ignore it -------------------',
-      config.sourceNpmRegistry);
+      sourceNpmRegistry);
     return;
   }
   var syncname = name;
   if (this.type === 'user') {
     syncname = this.type + ':' + syncname;
   }
-  var url = config.sourceNpmRegistry + '/' + syncname + '/sync?sync_upstream=true';
+
+  var url = sourceNpmRegistry + '/' + syncname + '/sync?sync_upstream=true';
   if (this.noDep) {
     url += '&nodeps=true';
   }
@@ -245,7 +256,7 @@ SyncModuleWorker.prototype.syncUpstream = function* (name) {
       url, r.status, r.data);
   }
 
-  var logURL = config.sourceNpmRegistry + '/' + name + '/sync/log/' + r.data.logId;
+  var logURL = sourceNpmRegistry + '/' + name + '/sync/log/' + r.data.logId;
   var offset = 0;
   this.log('----------------- Syncing upstream %s -------------------', logURL);
 
@@ -310,24 +321,29 @@ SyncModuleWorker.prototype.next = function* (concurrencyId) {
     return setImmediate(this.finish.bind(this));
   }
 
-  if (config.syncModel === 'none') {
+  const defineRegistry = this.getPrivatePackageDefineRegistry(name)
+
+  if (!defineRegistry && config.syncModel === 'none') {
     this.log('[c#%d] [%s] syncModel is none, ignore',
-      concurrencyId, name);
+     concurrencyId, name);
     return this.finish();
   }
 
-  // try to sync from official replicate when source npm registry is not cnpmjs.org
-  const registry = config.sourceNpmRegistryIsCNpm ? config.sourceNpmRegistry : config.officialNpmReplicate;
+  // try to sync from official replicate when no defineRegistry or source npm registry is not cnpmjs.org
+  let registry
+  if (defineRegistry) {
+    registry = defineRegistry
+  } else {
+    registry = config.sourceNpmRegistryIsCNpm ? config.sourceNpmRegistry : config.officialNpmReplicate;
+  }
 
   yield this.syncByName(concurrencyId, name, registry);
 };
 
-SyncModuleWorker.prototype.syncByName = function* (concurrencyId, name, registry, retryCount) {
-  retryCount = retryCount || 0;
-  var that = this;
-  that.syncingNames[name] = true;
-  var pkg = null;
-  var status = 0;
+// TODO unimplement unpublish
+SyncModuleWorker.prototype._syncByNameFromBackupFile = function* (concurrencyId, name, retryCount) {
+  const that = this;
+  this.syncingNames[name] = true;
 
   this.log('----------------- Syncing %s -------------------', name);
 
@@ -339,9 +355,198 @@ SyncModuleWorker.prototype.syncByName = function* (concurrencyId, name, registry
     return;
   }
 
+  // validate if unpublish
+  const unpublished = yield validateUnpublish(name);
+  if (unpublished) {
+    this.log('[c#%d] [%s] package is unpublished skip sync',
+      concurrencyId, name);
+    yield this._doneOne(concurrencyId, name, true);
+    return;
+  }
+
+  let packageJsons;
+  let tags;
+  try {
+    const packageDir = common.getSyncPackageDir(name);
+    const packageDirFiles = yield nfs.list(packageDir);
+    const packageJsonFileNames = packageDirFiles.filter(fileName => common.isBackupPkgFile(fileName));
+
+    const distTagDir = common.getSyncTagDir(name);
+    const distTagDirFiles = yield nfs.list(distTagDir);
+    const distTagFileNames = distTagDirFiles.filter(fileName => common.isBackupTagFile(fileName));
+
+    const packageJsonRes = yield gather(packageJsonFileNames.map(function* (packageJsonFileName) {
+      const version = common.getVersionFromFileName(packageJsonFileName);
+      return yield readPackage(name, version);
+    }), 5);
+    packageJsons = packageJsonRes.map(({ isError, error, value}) => {
+      if (isError) {
+        error.message = '[sync] read package.json failed: ' + error.message;
+        throw error;
+      }
+      return value;
+    });
+
+    packageJsons = packageJsons.sort((a, b) => {
+      return a.publish_time - b.publish_time;
+    });
+
+    const tagRes = yield gather(distTagFileNames.map(function* (tagFileName) {
+      const tag = common.getTagNameFromFileName(tagFileName);
+      const version = yield readDistTag(name, tag);
+      return {
+        tag,
+        version,
+      };
+    }));
+    tags = tagRes.map(({ isError, error, value}) => {
+      if (isError) {
+        error.message = '[sync] read dist-tag failed: ' + error.message;
+        throw error;
+      }
+      return value;
+    });
+  } catch (err) {
+    if (retryCount < 3) {
+      this.log('[c#%d] [%s] retry from oss after 3s, err: %s, retryCount: %s',
+        concurrencyId, name, err.stack, retryCount);
+      yield sleep(3000);
+      yield this._syncByNameFromBackupFile(concurrencyId, name, retryCount + 1);
+      return;
+    }
+    this.log('[c#%s] [error] [%s] sync error: %s', concurrencyId, name, err.stack);
+    yield this._doneOne(concurrencyId, name, false);
+    return;
+  }
+
+  const firstPkg = packageJsons[0];
+  const lastPkg = packageJsons[packageJsons.length - 1];
+
+  const times = packageJsons.reduce((times, packageJson) => {
+    times[packageJson.version] = new Date(packageJson.publish_time);
+    return times;
+  }, {
+    modified: new Date(lastPkg.publish_time),
+    created: new Date(firstPkg.publish_time),
+  });
+  const distTags = tags.reduce((distTags, tag) => {
+    distTags[tag.tag] = tag.version;
+    return distTags;
+  }, {});
+  const versions = packageJsons.reduce((versions, packageJson) => {
+    versions[packageJson.version] = packageJson;
+    return versions;
+  }, {});
+
+  const pkg = {
+    name,
+    'dist-tags': distTags,
+    versions: versions,
+    time: times,
+
+    description: lastPkg.description,
+    maintainers: lastPkg.maintainers,
+    author: lastPkg.author,
+    repository: lastPkg.repository,
+    readme: lastPkg.readme,
+    readmeFilename: lastPkg.readmeFilename,
+    homepage: lastPkg.homepage,
+    bugs: lastPkg.bugs,
+    license: lastPkg.license,
+  };
+
+  let syncVersions;
+  try {
+    syncVersions = yield this._sync(name, pkg);
+  } catch (err) {
+    this.log('[c#%s] [error] [%s] sync error: %s', concurrencyId, name, err.stack);
+    yield this._doneOne(concurrencyId, name, false);
+    return;
+  }
+
+  // has new version
+  if (syncVersions.length > 0) {
+    this.updates.push(name);
+  }
+
+  this.log('[c#%d] [%s] synced success, %d versions: %s',
+    concurrencyId, name, syncVersions.length, syncVersions.join(', '));
+  yield this._doneOne(concurrencyId, name, true);
+
+  return syncVersions;
+
+  function* validateUnpublish(name) {
+    const filePath = common.getTarballFilepath(name, '', `unpublish-package.json`);
+    const cdnKey = common.getUnpublishFileKey(name);
+    let unpublishInfo;
+    try {
+      yield nfs.download(cdnKey, filePath);
+      const packageJSONFile = yield mzFs.readFile(filePath, 'utf8');
+      unpublishInfo = JSON.parse(packageJSONFile);
+    } catch (_) {
+      // ...
+      return false;
+    } finally {
+      fs.unlink(filePath, utility.noop);
+    }
+    that.log('[c#%s] get unpublish info', concurrencyId, name);
+    yield that._unpublished(name, unpublishInfo);
+    return true;
+  }
+
+  function* readPackage(name, version) {
+    const filePath = common.getTarballFilepath(name, version, `package-${version}.json`);
+    const packageJsonKey = common.getPackageFileCDNKey(name, version);
+    try {
+      yield nfs.download(packageJsonKey, filePath);
+      const packageJSONFile = yield mzFs.readFile(filePath, 'utf8');
+      console.log('file: ', filePath, packageJSONFile);
+      const packageJSON = JSON.parse(packageJSONFile);
+      return packageJSON;
+    } finally {
+      fs.unlink(filePath, utility.noop);
+    }
+  }
+
+  function* readDistTag(name, tag) {
+    const filePath = common.getTarballFilepath(name, '', `tag-${tag}.json`);
+    const packageJsonKey = common.getDistTagCDNKey(name, tag);
+    try {
+      yield nfs.download(packageJsonKey, filePath);
+      const version = yield mzFs.readFile(filePath, 'utf8');
+      return version;
+    } finally {
+      fs.unlink(filePath, utility.noop);
+    }
+  }
+};
+
+SyncModuleWorker.prototype.syncByName = function* (concurrencyId, name, registry, retryCount) {
+  if (this.syncFromBackupFile) {
+    yield this._syncByNameFromBackupFile(concurrencyId, name, retryCount);
+    return;
+  }
+
+  retryCount = retryCount || 0;
+  var that = this;
+  that.syncingNames[name] = true;
+  var pkg = null;
+  var status = 0;
+
+  this.log('----------------- Syncing %s -------------------', name);
+
+  const isNeedSyncPrivatePackage = this.getPrivatePackageDefineRegistry(name)
+  // ignore private scoped package
+  if (!isNeedSyncPrivatePackage && common.isPrivateScopedPackage(name)) {
+    this.log('[c#%d] [%s] ignore sync private scoped %j package',
+      concurrencyId, name, config.scopes);
+    yield this._doneOne(concurrencyId, name, true);
+    return;
+  }
+
   let realRegistry = registry;
   // get from npm, don't cache
-  const packageUrl = '/' + name.replace('/', '%2f') + '?sync_timestamp=' + Date.now();
+  const packageUrl = '/' + name.replace('/', '%2f') + '?cache=0&sync_timestamp=' + Date.now();
   try {
     var result = yield npmSerivce.request(packageUrl, { registry: registry });
     pkg = result.data;
@@ -498,6 +703,21 @@ SyncModuleWorker.prototype.syncByName = function* (concurrencyId, name, registry
   return versions;
 };
 
+SyncModuleWorker.prototype.getPrivatePackageDefineRegistry = function (name) {
+  if (typeof name !== 'string') return false
+  return this.syncPrivatePackage && this.syncPrivatePackage[name.split('/')[0]]
+}
+
+SyncModuleWorker.prototype.isLocalModule = function (mods) {
+  var res = common.isLocalModule(mods)
+  if (!this.syncPrivatePackage) return res
+  if (!mods[0] || !mods[0].package || !mods[0].package.name) return res
+
+  if (this.getPrivatePackageDefineRegistry(mods[0].package.name)) return false
+
+  return res
+}
+
 function* _listStarUsers(modName) {
   var users = yield packageService.listStarUserNames(modName);
   var userMap = {};
@@ -538,7 +758,7 @@ SyncModuleWorker.prototype._unpublished = function* (name, unpublishedInfo) {
   var mods = yield packageService.listModulesByName(name);
   this.log('  [%s] start unpublished %d versions from local cnpm registry',
     name, mods.length);
-  if (common.isLocalModule(mods)) {
+  if (this.isLocalModule(mods)) {
     // publish on cnpm, dont sync this version package
     this.log('  [%s] publish on local cnpm registry, don\'t sync', name);
     return [];
@@ -555,36 +775,39 @@ SyncModuleWorker.prototype._unpublished = function* (name, unpublishedInfo) {
   var r = yield packageService.saveUnpublishedModule(name, unpublishedInfo);
   this.log('    [%s] save unpublished info: %j to row#%s',
     name, unpublishedInfo, r.id);
-  if (mods.length === 0) {
-    return;
-  }
-  yield [
-    packageService.removeModulesByName(name),
-    packageService.removeModuleTags(name),
-  ];
-  var keys = [];
-  for (var i = 0; i < mods.length; i++) {
-    var row = mods[i];
-    var dist = row.package.dist;
-    var key = dist.key;
-    if (!key) {
-      key = urlparse(dist.tarball).pathname;
+  if (mods.length) {
+    yield [
+      packageService.removeModulesByName(name),
+      packageService.removeModuleTags(name),
+    ];
+    var keys = [];
+    for (var i = 0; i < mods.length; i++) {
+      var row = mods[i];
+      var dist = row.package.dist;
+      var key = dist.key;
+      if (!key) {
+        key = urlparse(dist.tarball).pathname;
+      }
+      key && keys.push(key);
     }
-    key && keys.push(key);
+
+    if (keys.length > 0) {
+      try {
+        yield keys.map(function (key) {
+          return nfs.remove(key);
+        });
+      } catch (err) {
+        // ignore error here
+        this.log('    [%s] delete nfs files: %j error: %s: %s',
+          name, keys, err.name, err.message);
+      }
+    }
+    this.log('    [%s] delete nfs files: %j success', name, keys);
   }
 
-  if (keys.length > 0) {
-    try {
-      yield keys.map(function (key) {
-        return nfs.remove(key);
-      });
-    } catch (err) {
-      // ignore error here
-      this.log('    [%s] delete nfs files: %j error: %s: %s',
-        name, keys, err.name, err.message);
-    }
+  if (config.syncBackupFiles) {
+    yield this._saveUnpublishFile(name, unpublishedInfo);
   }
-  this.log('    [%s] delete nfs files: %j success', name, keys);
 };
 
 SyncModuleWorker.prototype._sync = function* (name, pkg) {
@@ -603,7 +826,7 @@ SyncModuleWorker.prototype._sync = function* (name, pkg) {
   var existsNpmMaintainers = result[3];
   var existsModuleAbbreviateds = result[4];
 
-  if (common.isLocalModule(moduleRows)) {
+  if (this.isLocalModule(moduleRows)) {
     // publish on cnpm, dont sync this version package
     that.log('  [%s] publish on local cnpm registry, don\'t sync', name);
     return [];
@@ -649,6 +872,8 @@ SyncModuleWorker.prototype._sync = function* (name, pkg) {
 
   // get package AbbreviatedMetadata
   var remoteAbbreviatedMetadatas = {};
+  // store remote abbreviated versions
+  var remoteAbbreviatedVersionsMap = {};
   if (config.enableAbbreviatedMetadata) {
     // use ?cache=0 tell registry dont use cache result
     var packageUrl = '/' + name.replace('/', '%2f') + '?cache=0&sync_timestamp=' + Date.now();
@@ -668,11 +893,32 @@ SyncModuleWorker.prototype._sync = function* (name, pkg) {
           name, err, result.headers, result.data);
       }
       if (data) {
-        var versions = data && data.versions || {};
-        for (var version in versions) {
-          const item = versions[version];
-          if (item && typeof item._hasShrinkwrap === 'boolean') {
-            remoteAbbreviatedMetadatas[version] = { _hasShrinkwrap: item._hasShrinkwrap };
+        remoteAbbreviatedVersionsMap = data && data.versions || {};
+        for (var version in remoteAbbreviatedVersionsMap) {
+          const item = remoteAbbreviatedVersionsMap[version];
+          if (!item) {
+            continue;
+          }
+          let hasMetaData = false;
+          const metaData = {};
+          // _hasShrinkwrap maybe undefined, dont change it
+          if (typeof item._hasShrinkwrap === 'boolean') {
+            hasMetaData = true;
+            metaData._hasShrinkwrap = item._hasShrinkwrap;
+          }
+
+          // https://github.com/cnpm/cnpmjs.org/issues/1667
+          const metaDataKeys = [
+            'peerDependenciesMeta', 'os', 'cpu', 'libc', 'workspaces', 'hasInstallScript',
+          ];
+          for (const key of metaDataKeys) {
+            if (key in item) {
+              hasMetaData = true;
+              metaData[key] = item[key];
+            }
+          }
+          if (hasMetaData) {
+            remoteAbbreviatedMetadatas[version] = metaData;
           }
         }
       }
@@ -692,7 +938,7 @@ SyncModuleWorker.prototype._sync = function* (name, pkg) {
   var diffNpmMaintainers = [];
 
   // [
-  //   { name, version, _hasShrinkwrap }
+  //   { name, version, _hasShrinkwrap(boolean), peerDependenciesMeta(object), os(array), cpu(array), workspaces(array) }
   // ]
   var missingAbbreviatedMetadatas = [];
   // [
@@ -864,16 +1110,32 @@ SyncModuleWorker.prototype._sync = function* (name, pkg) {
           });
           changedVersions[v] = 1;
         }
+
         // find missing abbreviatedMetadata
         if (abbreviatedMetadata) {
           for (var key in abbreviatedMetadata) {
-            if (!(key in exists.package) || abbreviatedMetadata[key] !== exists.package[key]) {
-              missingAbbreviatedMetadatas.push(Object.assign({
-                id: exists.id,
-                name: exists.package.name,
-                version: exists.package.version,
-              }, abbreviatedMetadata));
-              break;
+            const value = abbreviatedMetadata[key];
+            // boolean: _hasShrinkwrap, hasInstallScript
+            if ((key === '_hasShrinkwrap' || key === 'hasInstallScript') && typeof value === 'boolean') {
+              if (!(key in exists.package) || abbreviatedMetadata[key] !== exists.package[key]) {
+                missingAbbreviatedMetadatas.push(Object.assign({
+                  id: exists.id,
+                  name: exists.package.name,
+                  version: exists.package.version,
+                }, abbreviatedMetadata));
+                break;
+              }
+            } else if (Array.isArray(value) || (typeof value === 'object' && value)) {
+              // array: os, cpu, workspaces, libc
+              // object: peerDependenciesMeta
+              if (existsModuleAbbreviated && !(key in existsModuleAbbreviated.package)) {
+                missingAbbreviatedMetadatas.push(Object.assign({
+                  id: exists.id,
+                  name: exists.package.name,
+                  version: exists.package.version,
+                }, abbreviatedMetadata));
+                break;
+              }
             }
           }
         }
@@ -945,7 +1207,7 @@ SyncModuleWorker.prototype._sync = function* (name, pkg) {
     var tries = 3;
     while (true) {
       try {
-        yield that._syncOneVersion(index, syncModule);
+        yield that._syncOneVersion(index, syncModule, remoteAbbreviatedVersionsMap[syncModule.version]);
         syncedVersionNames.push(syncModule.version);
         break;
       } catch (err) {
@@ -1096,7 +1358,7 @@ SyncModuleWorker.prototype._sync = function* (name, pkg) {
     that.log('  [%s] saving %d missing moduleAbbreviateds', name, missingModuleAbbreviateds.length);
 
     var res = yield gather(missingModuleAbbreviateds.map(function (item) {
-      return packageService.saveModuleAbbreviated(item);
+      return packageService.saveModuleAbbreviated(item, remoteAbbreviatedVersionsMap[item.version]);
     }));
 
     for (var i = 0; i < res.length; i++) {
@@ -1315,7 +1577,7 @@ SyncModuleWorker.prototype._sync = function* (name, pkg) {
   return syncedVersionNames;
 };
 
-SyncModuleWorker.prototype._syncOneVersion = function *(versionIndex, sourcePackage) {
+SyncModuleWorker.prototype._syncOneVersion = function *(versionIndex, sourcePackage, remoteAbbreviatedVersion) {
   var delay = Date.now() - sourcePackage.publish_time;
   logger.syncInfo('[sync_module_worker] delay: %s ms, publish_time: %s, start sync %s@%s',
     delay, utility.logDate(new Date(sourcePackage.publish_time)),
@@ -1324,6 +1586,12 @@ SyncModuleWorker.prototype._syncOneVersion = function *(versionIndex, sourcePack
   var username = this.username;
   var downurl = sourcePackage.dist.tarball;
   var urlobj = urlparse(downurl);
+  // let cnpmjs.org registry know this request send from sync worker
+  if (downurl.indexOf('?') > 0) {
+    downurl = `${downurl}&cache=0&sync_timestamp=${Date.now()}`;
+  } else {
+    downurl = `${downurl}?cache=0&sync_timestamp=${Date.now()}`;
+  }
   var filename = path.basename(urlobj.pathname);
   var filepath = common.getTarballFilepath(sourcePackage.name, sourcePackage.version, filename);
   var ws = fs.createWriteStream(filepath);
@@ -1452,7 +1720,7 @@ SyncModuleWorker.prototype._syncOneVersion = function *(versionIndex, sourcePack
       throw err;
     }
     logger.syncInfo('[sync_module_worker] uploaded, saving %j to database', result);
-    var r = yield afterUpload(result);
+    var r = yield afterUpload(result, remoteAbbreviatedVersion);
     logger.syncInfo('[sync_module_worker] sync %s@%s done!',
       sourcePackage.name, sourcePackage.version);
     return r;
@@ -1461,7 +1729,7 @@ SyncModuleWorker.prototype._syncOneVersion = function *(versionIndex, sourcePack
     fs.unlink(filepath, utility.noop);
   }
 
-  function *afterUpload(result) {
+  function *afterUpload(result, remoteAbbreviatedVersion) {
     //make sure sync module have the correct author info
     //only if can not get maintainers, use the username
     var author = username;
@@ -1488,11 +1756,13 @@ SyncModuleWorker.prototype._syncOneVersion = function *(versionIndex, sourcePack
       mod.package._publish_on_cnpm = true;
     }
 
-    var dist = {
+    // keep orgin dist fields, like `integrity` and so on
+    var dist = Object.assign({}, sourcePackage.dist, {
+      tarball: '',
       shasum: shasum,
       size: dataSize,
       noattachment: dataSize === 0,
-    };
+    });
 
     if (result.url) {
       dist.tarball = result.url;
@@ -1505,7 +1775,7 @@ SyncModuleWorker.prototype._syncOneVersion = function *(versionIndex, sourcePack
     var r = yield packageService.saveModule(mod);
     var moduleAbbreviatedId = null;
     if (config.enableAbbreviatedMetadata) {
-      var moduleAbbreviatedResult = yield packageService.saveModuleAbbreviated(mod);
+      var moduleAbbreviatedResult = yield packageService.saveModuleAbbreviated(mod, remoteAbbreviatedVersion);
       moduleAbbreviatedId = moduleAbbreviatedResult.id;
     }
 
@@ -1523,6 +1793,141 @@ SyncModuleWorker.prototype._syncOneVersion = function *(versionIndex, sourcePack
   }
 };
 
+SyncModuleWorker.prototype._saveBackupFiles = function *() {
+  if (!config.syncBackupFiles) {
+    return;
+  }
+  const pkgNames = Object.keys(this.nameMap);
+  const that = this;
+  yield gather(pkgNames.map(function* (pkgName) {
+    yield that._saveBackupFile(pkgName);
+  }), 5);
+};
+
+SyncModuleWorker.prototype._saveBackupFile = function *(pkgName) {
+  const [ mods, tags ] = yield [
+    packageService.listModulesByName(pkgName, [ 'version' ]),
+    packageService.listModuleTags(pkgName),
+  ];
+  const that = this;
+  yield gather(mods.map(function* (mod) {
+    yield that._savePackageJsonBackup(pkgName, mod.version);
+  }), 5);
+  yield gather(tags.map(function* (tag) {
+    yield that._saveDistTagBackup(pkgName, tag.tag, tag.version);
+  }), 5);
+  yield this._clearDeletedDistTags(pkgName, tags.map(t => t.tag));
+};
+
+SyncModuleWorker.prototype._saveUnpublishFile = function* (pkgName, pkg) {
+  const cdnKey = common.getUnpublishFileKey(pkgName);
+  const filePath = common.getTarballFilepath(pkgName, '', 'unpublish-package.json');
+  this.log('[%s] start save unpublish-package.json', pkgName);
+  const file = JSON.stringify(pkg);
+  yield mzFs.writeFile(filePath, file);
+
+  let shasum = crypto.createHash('sha1');
+  shasum.update(file);
+  shasum = shasum.digest('hex');
+
+  yield nfs.upload(filePath, {
+    key: cdnKey,
+    size: file.length,
+    shasum: shasum,
+  });
+  this.log('[%s:%s] save unpublish package.json backup success', pkgName);
+};
+
+SyncModuleWorker.prototype._savePackageJsonBackup = function *(pkgName, version) {
+  const cdnKey = common.getPackageFileCDNKey(pkgName, version);
+  const filePath = common.getTarballFilepath(pkgName, version, `package-${version}.json`);
+  this.log('[%s:%s] start backup package.json', pkgName, version);
+  // If package.json exists no need to sync
+  try {
+    yield nfs.download(cdnKey, filePath);
+    fs.unlink(filePath, utility.noop);
+    this.log('[%s:%s] package.json exits skip backup', pkgName, version);
+    // Download success, no need to sync
+    return;
+  } catch (_) {
+    // ...
+  }
+  // Version is from db, so mod can not be null
+  const mod = yield packageService.showPackage(pkgName, version, {
+    protocol: config.backupProtocol,
+  });
+
+  const file = JSON.stringify(mod.package);
+  yield mzFs.writeFile(filePath, file);
+
+  let shasum = crypto.createHash('sha1');
+  shasum.update(file);
+  shasum = shasum.digest('hex');
+
+  yield nfs.upload(filePath, {
+    key: cdnKey,
+    size: file.length,
+    shasum: shasum,
+  });
+  this.log('[%s:%s] package.json backup success', pkgName, version);
+};
+
+SyncModuleWorker.prototype._saveDistTagBackup = function *(pkgName, tag, version) {
+  const cdnKey = common.getDistTagCDNKey(pkgName, tag);
+  const filePath = common.getTarballFilepath(pkgName, '', `tag-${tag}.json`);
+  this.log('[%s:%s] start backup dist-tag.json', pkgName, tag);
+  let oldVersion;
+  try {
+    yield nfs.download(cdnKey, filePath);
+    oldVersion = yield mzFs.readFile(filePath, 'utf8');
+    fs.unlink(filePath, utility.noop);
+  } catch (_) {
+    // ...
+  }
+  this.log('[%s:%s] backup dist tag is %j current dist tag is %j', pkgName, tag, oldVersion, version);
+  if (oldVersion === version) {
+    this.log('[%s:%s] tag equal skip sync', pkgName, tag);
+    return;
+  }
+  this.log('[%s:%s] tag not equal start sync', pkgName, tag);
+  const file = version;
+  yield mzFs.writeFile(filePath, file);
+
+  let shasum = crypto.createHash('sha1');
+  shasum.update(file);
+  shasum = shasum.digest('hex');
+
+  yield nfs.upload(filePath, {
+    key: cdnKey,
+    size: file.length,
+    shasum: shasum,
+  });
+  this.log('[%s:%s] backup dist tag success', pkgName, tag);
+};
+
+SyncModuleWorker.prototype._clearDeletedDistTags = function *(pkgName, tagNames) {
+  const syncDir = common.getSyncTagDir(pkgName);
+  const backupDistTagFiless = yield nfs.list(syncDir);
+  const currentTagNames = new Set(tagNames);
+  const shouldDelTags = backupDistTagFiless.filter(tagFileName => {
+    const tagName = common.getTagNameFromFileName(tagFileName);
+    return (
+      // File is an dist-tag file
+      tagName
+      // tag is deleted
+      && !currentTagNames.has(tagName)
+    );
+  });
+  this.log('[%s] current tags %j backup tags %j should delete tags %j', pkgName, tagNames, backupDistTagFiless, shouldDelTags);
+  const that = this;
+  yield shouldDelTags.map(function* (tagFileName) {
+    const filePath = path.join(syncDir, tagFileName);
+    that.log('[%s] delete tags %s', pkgName, filePath);
+    yield nfs.remove(filePath);
+  });
+  this.log('[%s] delete tags success', pkgName);
+};
+
 SyncModuleWorker.sync = function* (name, username, options) {
   options = options || {};
   var result = yield logService.create({name: name, username: username});
@@ -1534,6 +1939,8 @@ SyncModuleWorker.sync = function* (name, username, options) {
     noDep: options.noDep,
     publish: options.publish,
     syncUpstreamFirst: options.syncUpstreamFirst,
+    syncFromBackupFile: options.syncFromBackupFile,
+    syncPrivatePackage: options.syncPrivatePackage
   });
   worker.start();
   return result.id;

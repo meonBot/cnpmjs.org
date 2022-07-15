@@ -1,3 +1,51 @@
+
+3.0.0-rc.50 / 2021-11-04
+==================
+
+**features**
+  * [[`e4c3cd1`](http://github.com/cnpm/cnpmjs.org/commit/e4c3cd125ebe771ecc31b4a207ab926c13817f16)] - feat: package view add download total count (#1673) (Solais <<924615994@qq.com>>)
+  * [[`283f149`](http://github.com/cnpm/cnpmjs.org/commit/283f14976dae8ce9144d387533d1637a79c6cf12)] - feat: add missing abbreviated meta attibutes (#1668) (fengmk2 <<fengmk2@gmail.com>>)
+
+**fixes**
+  * [[`62fdbd4`](http://github.com/cnpm/cnpmjs.org/commit/62fdbd400a2259983c6793173ac8d816a732452c)] - fix: should update etag after abbreviated meta change (#1670) (fengmk2 <<fengmk2@gmail.com>>)
+  * [[`2e7354c`](http://github.com/cnpm/cnpmjs.org/commit/2e7354c647d78a41f033f2066c6eb60e270f2a6b)] - fix: allow download without scope filename (#1665) (killa <<killa123@126.com>>)
+
+3.0.0-rc.46 / 2021-09-10
+==================
+
+**fixes**
+  * [[`596bca9`](http://github.com/cnpm/cnpmjs.org/commit/596bca908ee87504dfeb3dbf463b4d9a551d9f27)] - fix: fs-cnpm on dockerize config (#1656) (wxhuang <<wxhuang1985@gmail.com>>)
+  * [[`bbae9d3`](http://github.com/cnpm/cnpmjs.org/commit/bbae9d3bc3a565a59c397a63c4301272ac4509e9)] - fix: new publish with token should add user to maintainers (#1662) (killa <<killa123@126.com>>)
+
+3.0.0-rc.45 / 2021-07-28
+==================
+
+**features**
+  * [[`d28af7f`](http://github.com/cnpm/cnpmjs.org/commit/d28af7fd7e1bf530ad2e5a73fa5a54d2caf5cf9b)] - feat: support custom tokenService (#1658) (killa <<killa123@126.com>>)
+
+**others**
+  * [[`e258241`](http://github.com/cnpm/cnpmjs.org/commit/e2582417fa06a82c2fbb4d08eaf764465683a00b)] - remove maintainers logic (#1654) (Solais <<924615994@qq.com>>)
+3.0.0-rc.44 / 2021-06-11
+==================
+
+**features**
+  * [[`a1e8a82`](https://github.com/cnpm/cnpmjs.org/commit/a1e8a8289276275b995d15b3c254fbdbace6dbae)] - feat: impl npm owner hooks (#1645) (killa <<killa123@126.com>>)
+
+3.0.0-rc.43 / 2021-05-36
+==================
+
+**features**
+  * [[`a21aed0`](https://github.com/cnpm/cnpmjs.org/commit/a21aed08c5fe1ea09f4fda157ac3c12bd609781d)] - feat: impl sync to/from backup files (#1612) (killa <<killa123@126.com>>)
+
+**fixes**
+  * [[`2245dc2`](https://github.com/cnpm/cnpmjs.org/commit/2245dc2967ec070b8bcc618ebfad0cd4cd297fb8)] - feat: impl accelerate request (#1637) (killa <<killa123@126.com>>)
+
+3.0.0-rc.42 / 2021-04-30
+==================
+
+**features**
+  * [[`a21aed0`](https://github.com/cnpm/cnpmjs.org/commit/a21aed08c5fe1ea09f4fda157ac3c12bd609781d)] - feat: impl sync to/from backup files (#1612) (killa <<killa123@126.com>>)
+
 3.0.0-rc.39 / 2021-01-14
 ==================
 

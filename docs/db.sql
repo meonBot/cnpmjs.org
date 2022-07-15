@@ -82,8 +82,8 @@ CREATE TABLE IF NOT EXISTS `module` (
  `author` varchar(100) NOT NULL COMMENT 'module author',
  `name` varchar(214) CHARACTER SET utf8 COLLATE utf8_bin NOT NULL COMMENT 'module name',
  `version` varchar(30) NOT NULL COMMENT 'module version',
- `description` longtext COMMENT 'module description',
- `package` longtext CHARACTER SET utf8 COLLATE utf8_general_ci COMMENT 'package.json',
+ `description` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci COMMENT 'module description',
+ `package` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci COMMENT 'package.json',
  `dist_shasum` varchar(100) DEFAULT NULL COMMENT 'module dist SHASUM',
  `dist_tarball` varchar(2048) DEFAULT NULL COMMENT 'module dist tarball',
  `dist_size` int(10) unsigned NOT NULL DEFAULT '0' COMMENT 'module dist size',
@@ -333,3 +333,14 @@ CREATE TABLE IF NOT EXISTS `token` (
  UNIQUE KEY `uk_token` (`token`),
  KEY `idx_user` (`user_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8 COMMENT='token info';
+
+CREATE TABLE IF NOT EXISTS `package_version_blocklist` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT COMMENT 'primary key',
+  `gmt_create` datetime(3) NOT NULL COMMENT 'create time',
+  `gmt_modified` datetime(3) NOT NULL COMMENT 'modified time',
+  `name` varchar(214) NOT NULL COMMENT 'package name',
+  `version` varchar(30) NOT NULL COMMENT 'package version, "*" meaning all versions',
+  `reason` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL COMMENT 'block reason',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_name_version` (`name`, `version`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci COMMENT='package version block list';

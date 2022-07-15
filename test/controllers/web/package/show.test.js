@@ -1,11 +1,13 @@
 'use strict';
 
 var should = require('should');
+var assert = require('assert');
 var request = require('supertest');
 var mm = require('mm');
 var config = require('../../../../config');
 var app = require('../../../../servers/web');
 var registry = require('../../../../servers/registry');
+var blocklistService = require('../../../../services/blocklist');
 var utils = require('../../../utils');
 
 describe('test/controllers/web/package/show.test.js', () => {
@@ -55,6 +57,41 @@ describe('test/controllers/web/package/show.test.js', () => {
       });
     });
 
+    it('should get block package', function* () {
+      var pkg = utils.getPackage('@cnpmtest/testmodule-web-show-block', '0.0.1', utils.admin);
+      pkg.versions['0.0.1'].dependencies = {
+        bytetest: '~0.0.1',
+        mocha: '~1.0.0',
+        'testmodule-web-show': '0.0.1'
+      };
+      yield request(registry)
+        .put('/' + pkg.name)
+        .set('authorization', utils.adminAuth)
+        .send(pkg)
+        .expect(201);
+      
+      yield blocklistService.blockPackageVersion('@cnpmtest/testmodule-web-show-block', '0.0.1', 'unittest');
+      let res = yield request(app)
+        .get('/package/@cnpmtest/testmodule-web-show-block')
+        .expect(451)
+        .expect('content-type', 'text/plain; charset=utf-8');
+      assert(res.text === '[block] package@0.0.1 was blocked, reason: unittest');
+
+      yield blocklistService.blockPackageVersion('@cnpmtest/testmodule-web-show-block', '0.0.1', 'unittest');
+      res = yield request(app)
+        .get('/package/@cnpmtest/testmodule-web-show-block/0.0.1')
+        .expect(451)
+        .expect('content-type', 'text/plain; charset=utf-8');
+      assert(res.text === '[block] package@0.0.1 was blocked, reason: unittest');
+
+      yield blocklistService.blockPackageVersion('@cnpmtest/testmodule-web-show-block', '*', 'block all');
+      res = yield request(app)
+        .get('/package/@cnpmtest/testmodule-web-show-block')
+        .expect(451)
+        .expect('content-type', 'text/plain; charset=utf-8');
+      assert(res.text === '[block] package@0.0.1 was blocked, reason: block all');
+    });
+
     it('should get scoped package', function (done) {
       request(app)
       .get('/package/@cnpmtest/testmodule-web-show')
@@ -75,6 +112,36 @@ describe('test/controllers/web/package/show.test.js', () => {
       request(app)
       .get('/package/@cnpmtest/not-exist-module')
       .expect(404, done);
+    });
+
+    it('should get 404 show sync button on scoped package', done => {
+      mm(config, 'syncModel', 'all');
+      request(app)
+        .get('/package/@cnpmtest/testmodule-repo-short-https-404')
+        .expect(404)
+        .expect('content-type', 'text/html; charset=utf-8')
+        .expect(/>SYNC<\/a> from official npm registry/)
+        .expect(/Can not found package match @cnpmtest\/testmodule-repo-short-https-404/, done);
+    });
+
+    it('should get 404 show sync button on scoped package with encode url', done => {
+      mm(config, 'syncModel', 'all');
+      request(app)
+        .get('/package/%40foo%2Fawdawda')
+        .expect(404)
+        .expect('content-type', 'text/html; charset=utf-8')
+        .expect(/>SYNC<\/a> from official npm registry/)
+        .expect(/Can not found package match @foo\/awdawda/, done);
+    });
+
+    it('should get 404 show sync button on non-scoped package', done => {
+      mm(config, 'syncModel', 'all');
+      request(app)
+        .get('/package/testmodule-repo-short-https-404')
+        .expect(404)
+        .expect('content-type', 'text/html; charset=utf-8')
+        .expect(/>SYNC<\/a> from official npm registry/)
+        .expect(/Can not found package match testmodule-repo-short-https-404/, done);
     });
   });
 

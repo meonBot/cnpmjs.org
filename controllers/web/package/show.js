@@ -12,9 +12,14 @@ var utils = require('../../utils');
 var setDownloadURL = require('../../../lib/common').setDownloadURL;
 var renderMarkdown = require('../../../common/markdown').render;
 var packageService = require('../../../services/package');
+var blocklistService = require('../../../services/blocklist');
 var downloadTotalService = require('../../../services/download_total');
+var showWithRemote = require('./showWithRemote');
 
 module.exports = function* show(next) {
+  if (config.enableWebDataRemoteRegistry) {
+    return yield showWithRemote(this, next);
+  }
   var params = this.params;
   // normal: {name: $name, version: $version}
   // scope: [$name, $version]
@@ -69,6 +74,16 @@ module.exports = function* show(next) {
     }
 
     return yield next;
+  }
+
+  var blocks = yield blocklistService.findBlockPackageVersions(name);
+  if (blocks) {
+    var block = blocks['*'] || blocks[pkg.version];
+    if (block) {
+      this.status = 451;
+      this.body = `[block] package@${pkg.version} was blocked, reason: ${block.reason}`;
+      return;
+    }
   }
 
   var r = yield [

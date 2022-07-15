@@ -3,6 +3,7 @@
 var semver = require('semver');
 var models = require('../models');
 var common = require('./common');
+var libCommon = require('../lib/common');
 var config = require('../config');
 var Tag = models.Tag;
 var User = models.User;
@@ -152,27 +153,19 @@ exports.listModulesByUser = function* (username) {
 exports.listModuleNamesByUser = function* (username) {
   var sql = 'SELECT distinct(name) AS name FROM module WHERE author=?;';
   var rows = yield models.query(sql, [username]);
-  var map = {};
   var names = rows.map(function (r) {
     return r.name;
   });
 
   // find from npm module maintainer table
   var moduleNames = yield NpmModuleMaintainer.listModuleNamesByUser(username);
-  moduleNames.forEach(function (name) {
-    if (!map[name]) {
-      names.push(name);
-    }
-  });
-
   // find from private module maintainer table
-  moduleNames = yield PrivateModuleMaintainer.listModuleNamesByUser(username);
-  moduleNames.forEach(function (name) {
-    if (!map[name]) {
-      names.push(name);
-    }
-  });
-  return names;
+  var privateModuleNames = yield PrivateModuleMaintainer.listModuleNamesByUser(username);
+  return Array.from(new Set([
+    ...names,
+    ...moduleNames,
+    ...privateModuleNames,
+  ]));
 };
 
 exports.listPublicModulesByUser = function* (username) {
@@ -354,23 +347,22 @@ exports.findAllModuleAbbreviateds = function* (where, order, limit, offset) {
 };
 
 // https://github.com/npm/registry/blob/master/docs/responses/package-metadata.md#abbreviated-version-object
-exports.saveModuleAbbreviated = function* (mod) {
-  var pkg = JSON.stringify({
-    name: mod.package.name,
-    version: mod.package.version,
-    deprecated: mod.package.deprecated,
-    dependencies: mod.package.dependencies,
-    optionalDependencies: mod.package.optionalDependencies,
-    devDependencies: mod.package.devDependencies,
-    bundleDependencies: mod.package.bundleDependencies,
-    peerDependencies: mod.package.peerDependencies,
-    bin: mod.package.bin,
-    directories: mod.package.directories,
-    dist: mod.package.dist,
-    engines: mod.package.engines,
-    _hasShrinkwrap: mod.package._hasShrinkwrap,
-    _publish_on_cnpm: mod.package._publish_on_cnpm,
-  });
+exports.saveModuleAbbreviated = function* (mod, remoteAbbreviatedVersion) {
+  // try to use remoteAbbreviatedVersion first
+  var pkg;
+  if (remoteAbbreviatedVersion) {
+    pkg = Object.assign({}, remoteAbbreviatedVersion, {
+      // override remote tarball
+      dist: Object.assign({}, remoteAbbreviatedVersion.dist, mod.package.dist, {
+        noattachment: undefined,
+      }),
+    });
+  } else {
+    pkg = Object.assign({}, mod.package, {
+      // ignore readme force
+      readme: undefined,
+    });
+  }
   var publish_time = mod.publish_time || Date.now();
   var item = yield models.ModuleAbbreviated.findByNameAndVersion(mod.name, mod.version);
   if (!item) {
@@ -380,7 +372,7 @@ exports.saveModuleAbbreviated = function* (mod) {
     });
   }
   item.publish_time = publish_time;
-  item.package = pkg;
+  item.package = JSON.stringify(pkg);
 
   if (item.changed()) {
     item = yield item.save();
@@ -416,7 +408,7 @@ exports.updateModulePackageFields = function* (id, fields) {
 };
 
 exports.updateModuleAbbreviatedPackage = function* (item) {
-  // item => { id, name, version, _hasShrinkwrap }
+  // item => { id, name, version, _hasShrinkwrap, os, cpu, peerDependenciesMeta, workspaces }
   var mod = yield models.ModuleAbbreviated.findByNameAndVersion(item.name, item.version);
   if (!mod) {
     return null;
@@ -864,4 +856,46 @@ exports.saveUnpublishedModule = function* (name, pkg) {
 
 exports.getUnpublishedModule = function* (name) {
   return yield ModuleUnpublished.findByName(name);
+};
+
+exports.showPackage = function* (name, tag, ctx) {
+  if (tag === '*') {
+    tag = 'latest';
+  }
+  if (tag === '*') {
+    tag = 'latest';
+  }
+  var version = semver.valid(tag);
+  var range = semver.validRange(tag);
+  var mod;
+  if (version) {
+    mod = yield exports.getModule(name, version);
+  } else if (range) {
+    mod = yield exports.getModuleByRange(name, range);
+  } else {
+    mod = yield exports.getModuleByTag(name, tag);
+  }
+
+  if (mod) {
+    libCommon.setDownloadURL(mod.package, ctx || {});
+    mod.package._cnpm_publish_time = mod.publish_time;
+    mod.package.publish_time = mod.package.publish_time || mod.publish_time;
+    var rs = yield [
+      exports.listMaintainers(name),
+      exports.listModuleTags(name),
+    ];
+    var maintainers = rs[0];
+    if (maintainers.length > 0) {
+      mod.package.maintainers = maintainers;
+    }
+    var tags = rs[1];
+    var distTags = {};
+    for (var i = 0; i < tags.length; i++) {
+      var t = tags[i];
+      distTags[t.tag] = t.version;
+    }
+    // show tags for npminstall faster download
+    mod.package['dist-tags'] = distTags;
+    return mod;
+  }
 };

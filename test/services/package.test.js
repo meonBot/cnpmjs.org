@@ -5,6 +5,8 @@ var sleep = require('co-sleep');
 var Package = require('../../services/package');
 var utils = require('../utils');
 var common = require('../../services/common');
+var config = require('../../config');
+var mm = require('mm');
 
 describe('test/services/package.test.js', function () {
   describe('addModuleTag()', function () {
@@ -127,6 +129,71 @@ describe('test/services/package.test.js', function () {
       var modules = yield Package.listPrivateModulesByScope('@cnpm-test');
       modules.should.length(2);
       modules[0].name.should.containEql('@cnpm-test/test-listPrivateModules-module-');
+    });
+  });
+
+  describe('listModelSince()', function () {
+    it('list tags since', function* () {
+      mm(config, 'changesDelay', 0);
+      yield utils.createModule('test-listModuleSince-module-0', '1.0.0');
+      yield sleep(2100);
+      var start = Date.now() - 1000;
+      yield utils.createModule('test-listModuleSince-module-1', '1.0.0');
+      yield utils.createModule('test-listModuleSince-module-1', '1.0.1', null, 'beta');
+      yield utils.createModule('test-listModuleSince-module-2', '1.0.0');
+      var tags = yield Package.listTagSince(start);
+
+      var modules = tags.map(function (item) {
+        return { name: item.id, tag: item.changes[0].tag };
+      });
+
+      modules
+        .should.eql([
+          { name: "test-listModuleSince-module-1", tag: "latest" },
+          { name: "test-listModuleSince-module-1", tag: "beta" },
+          { name: "test-listModuleSince-module-2", tag: "latest" },
+        ]);
+
+      tags = yield Package.listTagSince(start, 2);
+      modules = tags.map(function (item) {
+        return { name: item.id, tag: item.changes[0].tag};
+      });
+      modules
+        .should.eql([
+          { name: "test-listModuleSince-module-1", tag: "latest" },
+          { name: "test-listModuleSince-module-1", tag: "beta" },
+        ]);
+    });
+    it('list package version since', function* () {
+      mm(config, 'changesDelay', 0);
+      yield utils.createModule('test-listModuleSince-module-0', '1.0.0');
+      yield sleep(2100);
+      var start = Date.now() - 1000;
+      yield utils.createModule('test-listModuleSince-module-1', '1.0.0');
+      yield utils.createModule('test-listModuleSince-module-1', '1.0.1', null, 'beta');
+      yield utils.createModule('test-listModuleSince-module-2', '1.0.0');
+      var tags = yield Package.listVersionSince(start);
+
+      var modules = tags.map(function (item) {
+        return { name: item.id, version: item.changes[0].version };
+      });
+
+      modules
+        .should.eql([
+          { name: "test-listModuleSince-module-1", version: "1.0.0" },
+          { name: "test-listModuleSince-module-1", version: "1.0.1" },
+          { name: "test-listModuleSince-module-2", version: "1.0.0" },
+        ]);
+
+      tags = yield Package.listVersionSince(start, 2);
+      modules = tags.map(function (item) {
+        return { name: item.id, version: item.changes[0].version};
+      });
+      modules
+        .should.eql([
+          { name: "test-listModuleSince-module-1", version: "1.0.0" },
+          { name: "test-listModuleSince-module-1", version: "1.0.1" },
+        ]);
     });
   });
 
